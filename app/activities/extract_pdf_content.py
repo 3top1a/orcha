@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from temporalio import activity
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
+import asyncio
 
 from app.activities.utils import http_verify
 from app.extractors import get_extractor
@@ -52,7 +53,7 @@ async def extract_pdf_text(
         ) from e
 
     async with httpx.AsyncClient(verify=verify) as client:
-        response = await client.get(request.url)
+        response = await client.get(request.url, follow_redirects=True)
         response.raise_for_status()
         pdf_bytes = response.content
 

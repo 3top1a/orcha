@@ -18,6 +18,8 @@ def http_verify(url: str) -> bool:
     if hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost"):
         return False
 
+    return True
+
     allowlist = {
         host.strip().lower()
         for host in (settings.http_allowlist or "").split(",")
