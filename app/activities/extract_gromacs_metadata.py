@@ -185,19 +185,59 @@ def _parse_gmxextract_output(stdout: str) -> dict:
     )
 
 
+async def _probe_file_size(
+    client: httpx.AsyncClient, url: str
+) -> int | None:
+    """Return the size of *url*, or ``None`` when the server reports none.
+
+    A single 1-byte ranged request answers with headers only: S3 pre-signed
+    URLs (which reject HEAD) return ``Content-Range: bytes 0-0/<total>``,
+    plain servers answer 200 with ``Content-Length``.
+    """
+    try:
+        response = await client.get(url, headers={"Range": "bytes=0-0"})
+    except httpx.HTTPError as e:
+        logger.debug("extract_gromacs_metadata: size probe failed: %s", e)
+        return None
+    total: int | None = None
+    if response.status_code == 206:
+        try:
+            total = int(response.headers["content-range"].rsplit("/", 1)[1])
+        except (KeyError, ValueError, IndexError):
+            pass
+    elif response.status_code == 200:
+        try:
+            total = int(response.headers["content-length"])
+        except (KeyError, ValueError):
+            pass
+    if total is not None:
+        logger.info("extract_gromacs_metadata: %s is %d bytes", url, total)
+    return total
+
+
 async def _download_file(
     client: httpx.AsyncClient, url: str, path: str, max_bytes: int
 ) -> int:
-    """Download *url* to *path*, streaming and capping it at *max_bytes*.
+    """Download *url* to *path*, capped at *max_bytes* (see the probe).
 
-    Returns the number of bytes written. The check happens while reading, so
-    an oversized file is rejected after the first oversized chunk instead of
-    being buffered (or written to disk) in full.
+    When the probe reports a size, an oversized file is rejected before
+    anything is downloaded; otherwise the stream is capped while reading.
+
+    Returns:
+        The number of bytes written.
 
     Raises:
-        ApplicationError: with type ``FileTooLarge`` (non-retryable) when the
-            file reaches the size cap.
+        ApplicationError: ``FileTooLarge`` (non-retryable) when the file is
+            at or above the cap.
     """
+    size = await _probe_file_size(client, url)
+    if size is not None and size >= max_bytes:
+        raise ApplicationError(
+            f"File {url} is {size} bytes, which is at or above the "
+            f"{max_bytes} byte cap",
+            type="FileTooLarge",
+            non_retryable=True,
+        )
     total = 0
     async with client.stream("GET", url, follow_redirects=True) as response:
         response.raise_for_status()
