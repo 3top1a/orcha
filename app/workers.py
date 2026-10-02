@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import logging
 
 from pydantic_ai import Agent
 from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
@@ -61,6 +62,9 @@ def _configure_langfuse_client(settings: Settings):
 
 async def main(task_queue: str | None = None):
     """Start the Temporal worker."""
+    # Emit activity decision logs (e.g. extract_gromacs_metadata) to the
+    # console; the worker process has no other logging configuration.
+    logging.basicConfig(level=logging.INFO)
     init_engine()
     settings = get_settings()
     langfuse_client = _configure_langfuse_client(settings)

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Features
+- *(workflow)* Add `extract_metadata_multi`: extract metadata from a bundle of MD-simulation files (`.tpr`/`.gro`/`.top` loose files sharing a basename, or a single `.zip`/archive)
+  - New `extract_gromacs_metadata` activity downloads the bundle, runs `gmxextract` (configurable via `GMXEXTRACT_PYTHON`/`GMXEXTRACT_PYTHONPATH`/`GMXEXTRACT_SCRIPT`/`GMXEXTRACT_GMX_BIN`), and maps the JSON deterministically onto the repository's experiment metadata schema (absent values stay `null`, never fabricated)
+  - Result carries `provenance` (per-file status, every decision, exact command, full raw `gmxextract` JSON); every decision is also logged in worker logs (worker now configures INFO-level logging)
+  - No LLM involved; the single-file `extract_metadata` workflow (PDFs) is unchanged
+
 ## [0.6.0] - 2026-09-08
 
 ### Features

@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     http_allowlist: str | None = None
 
+    # GROMACS metadata extraction (gmxextract CLI).
+    gmxextract_python: str = "python3.13"
+    gmxextract_pythonpath: str = "/home/debian/gromacs-metadump/cli"
+    gmxextract_script: str = "/home/debian/gromacs-metadump/cli/gmxextract.py"
+    gmxextract_gmx_bin: str = "/home/debian/gromacs/build/bin/gmx"
+
     # LLM
     # TODO Currently we have only a single workflow, so single LLM configuration
     # is fine. We can parameterize it or make it configurable per workflow later.

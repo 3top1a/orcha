@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.database.models import Workflow, WorkflowStatus
 from app.main import app
 from app.tenants import TenantConfig, TenantRegistry
+from app.workflows.extract_metadata_multi_workflow import ExtractMetadataMultiParams
 
 # ---------- Generate two RSA key pairs (one per test tenant) ----------
 
@@ -467,6 +468,58 @@ def test_create_workflow_stamps_tenant_id(client, db_session, mocker):
     assert workflow_context.tenant_id == "tenant-a"
     assert workflow_context.user_id == "user-123"
     assert str(workflow_params.url) == "https://example.com/doc.pdf"
+
+
+def test_create_multi_file_workflow_stamps_tenant_id(client, db_session, mocker):
+    """POST /workflows/ with a multi-file bundle stamps tenant context."""
+    token = generate_test_token()
+
+    # Mock the temporal client to avoid real connection
+    mock_temporal = mocker.AsyncMock()
+    mocker.patch.object(client.app.state, "temporal_client", mock_temporal)
+
+    response = client.post(
+        "/workflows/",
+        json={
+            "workflow_type": "extract_metadata_multi",
+            "user_id": "user-123",
+            "params": {
+                "files": {
+                    "em.tpr": "https://example.com/em.tpr",
+                    "em.gro": "https://example.com/em.gro",
+                }
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+
+    # Verify the workflow was created with the correct tenant_id
+    created_id = response.json()["public_id"]
+    wf = db_session.get(Workflow, 1)
+    assert wf is not None
+    assert wf.tenant_id == "tenant-a"
+    assert wf.user_id == "user-123"
+    assert wf.workflow_type == "extract_metadata_multi"
+    assert wf.params == {
+        "files": {
+            "em.tpr": "https://example.com/em.tpr",
+            "em.gro": "https://example.com/em.gro",
+        }
+    }
+    assert wf.public_id == created_id
+    assert response.json()["user_id"] == "user-123"
+
+    mock_temporal.start_workflow.assert_awaited_once()
+    workflow_context, workflow_params = mock_temporal.start_workflow.await_args.kwargs[
+        "args"
+    ]
+    assert workflow_context.workflow_id == created_id
+    assert workflow_context.tenant_id == "tenant-a"
+    assert workflow_context.user_id == "user-123"
+    assert isinstance(workflow_params, ExtractMetadataMultiParams)
+    assert str(workflow_params.files["em.tpr"]) == "https://example.com/em.tpr"
+    assert str(workflow_params.files["em.gro"]) == "https://example.com/em.gro"
 
 
 def test_create_workflow_rejects_invalid_params(client, db_session, mocker):
