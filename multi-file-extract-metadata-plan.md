@@ -240,3 +240,8 @@ options:
 As for file selection, extract the basenames, and the choose most common basename.
 Make sure every decision such as this is logged.
 If possible, attach workflow logging to API result for provenance.
+
+
+The output from GMX is mapped into the metadata schema of the repository, specifically /home/debian/biosimtest/models/experiment/metadata.yaml. So if you extract say version of GROMACS the sim was ran with (not local), the JSON would return `metadata.simulation_setup.software_version: "version"` (the dots are compunded objects, can't be bothered to write {{{}}}).
+
+The paper (or study) is a different record than the experiment, therefore there wouldn't be a paper.pdf inside this experiment record. It is the users responsibility to have normal filenames. Two use cases: one `sim.zip` passed to gmxextract; multiple files with same basename but different extensions, e.g., em.top, em.gro, em.tpr.  
