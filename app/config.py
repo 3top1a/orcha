@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     gmxextract_pythonpath: str = "/home/debian/gromacs-metadump/cli"
     gmxextract_script: str = "/home/debian/gromacs-metadump/cli/gmxextract.py"
     gmxextract_gmx_bin: str = "/home/debian/gromacs/build/bin/gmx"
+    # Per-file download cap for the extract_gromacs_metadata activity, in bytes
+    # (default 50 MB); a bundle file at or above this is rejected before it
+    # can exhaust disk or memory.
+    gmxextract_max_download_bytes: int = 50 * 1024 * 1024
 
     # LLM
     # TODO Currently we have only a single workflow, so single LLM configuration

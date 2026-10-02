@@ -185,6 +185,35 @@ def _parse_gmxextract_output(stdout: str) -> dict:
     )
 
 
+async def _download_file(
+    client: httpx.AsyncClient, url: str, path: str, max_bytes: int
+) -> int:
+    """Download *url* to *path*, streaming and capping it at *max_bytes*.
+
+    Returns the number of bytes written. The check happens while reading, so
+    an oversized file is rejected after the first oversized chunk instead of
+    being buffered (or written to disk) in full.
+
+    Raises:
+        ApplicationError: with type ``FileTooLarge`` (non-retryable) when the
+            file reaches the size cap.
+    """
+    total = 0
+    async with client.stream("GET", url, follow_redirects=True) as response:
+        response.raise_for_status()
+        with open(path, "wb") as handle:
+            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                total += len(chunk)
+                if total >= max_bytes:
+                    raise ApplicationError(
+                        f"Download of {url} reached the {max_bytes} byte cap",
+                        type="FileTooLarge",
+                        non_retryable=True,
+                    )
+                handle.write(chunk)
+    return total
+
+
 @activity.defn
 async def extract_gromacs_metadata(
     request: ExtractGromacsMetadataRequest,
@@ -214,24 +243,22 @@ async def extract_gromacs_metadata(
         )
 
     with tempfile.TemporaryDirectory(prefix="gmxextract-") as tmpdir:
+        max_bytes = settings.gmxextract_max_download_bytes
         async with httpx.AsyncClient(verify=verify) as client:
             for name in names:
                 url = request.files[name]
-                response = await client.get(url, follow_redirects=True)
-                response.raise_for_status()
                 path = os.path.join(tmpdir, name)
-                with open(path, "wb") as handle:
-                    handle.write(response.content)
+                size = await _download_file(client, url, path, max_bytes)
                 logger.info(
                     "extract_gromacs_metadata: downloaded %s (%d bytes)",
                     name,
-                    len(response.content),
+                    size,
                 )
                 file_provenance.append(
                     {
                         "name": name,
                         "url": url,
-                        "bytes": len(response.content),
+                        "bytes": size,
                         "status": "ok",
                     }
                 )

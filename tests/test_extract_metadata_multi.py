@@ -7,11 +7,13 @@ Deterministic, no LLM: the params model (bundle of basename -> URL) and the
 pure ``_decide_files`` bundle-selection rule (archive vs loose tpr/gro/top).
 """
 
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 from temporalio.exceptions import ApplicationError
 
-from app.activities.extract_gromacs_metadata import _decide_files
+from app.activities.extract_gromacs_metadata import _decide_files, _download_file
 from app.workflows.extract_metadata_multi_workflow import ExtractMetadataMultiParams
 
 
@@ -156,3 +158,79 @@ def test_decide_files_empty_bundle_raises():
     with pytest.raises(ApplicationError) as excinfo:
         _decide_files([])
     assert excinfo.value.type == "NoTprInBundle"
+
+
+# ---------- _download_file size cap ----------
+
+
+class _FakeStreamResponse:
+    """Minimal async stream context manager yielding fixed-size chunks."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_bytes(self, chunk_size: int):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    """httpx.AsyncClient double that streams a fixed body."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def stream(self, method: str, url: str, follow_redirects: bool = True):
+        return _FakeStreamResponse(self._body)
+
+
+def test_download_file_writes_content(tmp_path):
+    """A file under the cap is written fully and its size is returned."""
+    path = tmp_path / "em.tpr"
+    size = asyncio.run(
+        _download_file(_FakeClient(b"hello"), "http://h/em.tpr", str(path), 100)
+    )
+    assert size == 5
+    assert path.read_bytes() == b"hello"
+
+
+def test_download_file_rejects_oversized(tmp_path):
+    """A file above the cap raises FileTooLarge and writes no more than the cap."""
+    path = tmp_path / "big.tpr"
+    with pytest.raises(ApplicationError) as excinfo:
+        asyncio.run(
+            _download_file(
+                _FakeClient(b"x" * 101), "http://h/big.tpr", str(path), 100
+            )
+        )
+    assert excinfo.value.type == "FileTooLarge"
+    assert excinfo.value.non_retryable is True
+    assert path.stat().st_size <= 100
+
+
+def test_download_file_rejects_at_limit(tmp_path):
+    """A file at exactly the cap is rejected (only smaller files pass)."""
+    path = tmp_path / "exact.tpr"
+    with pytest.raises(ApplicationError) as excinfo:
+        asyncio.run(
+            _download_file(
+                _FakeClient(b"x" * 100), "http://h/exact.tpr", str(path), 100
+            )
+        )
+    assert excinfo.value.type == "FileTooLarge"
+
+
+def test_default_download_cap_is_50mb():
+    """The default per-file cap is 50 MB."""
+    from app.config import Settings
+
+    assert Settings(_env_file=None).gmxextract_max_download_bytes == 50 * 1024 * 1024
