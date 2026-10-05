@@ -189,6 +189,12 @@ class _FakeClient:
     def __init__(self, body: bytes):
         self._body = body
 
+    async def get(self, url: str, headers: dict[str, str] | None = None):
+        # Size probe answers without a usable size header -> None.
+        return type(
+            "Resp", (), {"status_code": 206, "headers": {}}
+        )()
+
     def stream(self, method: str, url: str, follow_redirects: bool = True):
         return _FakeStreamResponse(self._body)
 

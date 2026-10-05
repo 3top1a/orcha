@@ -28,6 +28,7 @@ from io import StringIO
 from app.activities.utils import http_verify
 from app.config import get_settings
 from app.schemas.gromacs_metadata import map_gromacs_metadata_to_schema
+logger = logging.getLogger(__name__)
 
 EXTRACT_GROMACS_RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -136,7 +137,7 @@ def _decide_files(names: list[str]) -> tuple[list[str], list[str], list[tuple[st
         path = next((name for name in selected if name.endswith(ext)), None)
         if path is not None:
             argv_flag_pairs.extend([flag, path])
-            per_file_roles.append(f"{path} ({flag})")
+            per_file_roles.append(f"({flag}) {path}")
 
     if not any(name.endswith(".tpr") for name in selected):
         raise ApplicationError(
@@ -259,157 +260,134 @@ async def extract_gromacs_metadata(
 ) -> ExtractGromacsMetadataResponse:
     """Run gmxextract on the file bundle and map the output to the schema."""
     settings = get_settings()
-    decisions: list[dict] = []
     file_provenance: list[dict] = []
 
     # Create a new logger
-    logger = logging.getLogger(__name__ + '.extract_gromacs_metadata')
+    logger = logging.getLogger(__name__)
     loggerBuffer = StringIO()
     loggerHandler = logging.StreamHandler(loggerBuffer)
     logger.addHandler(loggerHandler)
-    
-    # Download all files with one client.
-    with tempfile.TemporaryDirectory(prefix="gmxextract-") as tmpdir:
-        max_bytes = settings.gmxextract_max_download_bytes
-        async with httpx.AsyncClient(verify=True) as client:
-            for filename, url in request.files.items():
-                path = os.path.join(tmpdir, filename)
 
-                if not http_verify(url):
-                    logger.info(
-                        "%s is not an allowed host, will not process",
-                        filename,
-                    )
+    try:
+        # Download all files with one client.
+        with tempfile.TemporaryDirectory(prefix="gmxextract-") as tmpdir:
+            max_bytes = settings.gmxextract_max_download_bytes
+            async with httpx.AsyncClient(verify=True) as client:
+                for filename, url in request.files.items():
+                    path = os.path.join(tmpdir, filename)
 
-                try:
-                    size = await _download_file(client, url, path, max_bytes)
-                except ApplicationError as e:
-                    file_provenance.append(
-                        {
-                            "name": filename,
-                            "bytes": size,
-                            "status": "error",
-                        }
-                    )
-                else:
-                    logger.info(
-                        "downloaded %s (%d bytes)",
-                        filename,
-                        size,
-                    )
-                    file_provenance.append(
-                        {
-                            "name": filename,
-                            "bytes": size,
-                            "status": "ok",
-                        }
-                    )
+                    if not http_verify(url):
+                        logger.info(
+                            "%s is not an allowed host, will not process",
+                            filename,
+                        )
 
-        # (b) Decide which files to pass to gmxextract.
-        # TODO The agent fucked up here, and first downloads all instead of first filtering and then downloading.
-        argv_flags, per_file_roles, dropped = _decide_files(request.files.keys())
-        mode = "archive" if argv_flags and argv_flags[0] == "--archive" else "loose"
-        for role in per_file_roles:
-            logger.info("selected file %s", role)
-        decisions.append(
-            {
-                "decision": "bundle_selected",
-                "value": mode,
-                "detail": "selected files: " + ", ".join(per_file_roles),
+                    size: int | None = None
+                    try:
+                        size = await _download_file(client, url, path, max_bytes)
+                    except ApplicationError as e:
+                        file_provenance.append(
+                            {
+                                "name": filename,
+                                "bytes": size,
+                                "status": "error",
+                            }
+                        )
+                    else:
+                        logger.info(
+                            "downloaded %s (%d bytes)",
+                            filename,
+                            size,
+                        )
+                        file_provenance.append(
+                            {
+                                "name": filename,
+                                "bytes": size,
+                                "status": "ok",
+                            }
+                        )
+
+            # (b) Decide which files to pass to gmxextract.
+            # TODO The agent fucked up here, and first downloads all instead of first filtering and then downloading.
+            argv_flags, per_file_roles, dropped = _decide_files(request.files.keys())
+            mode = "archive" if argv_flags and argv_flags[0] == "--archive" else "loose"
+            logger.info(
+                "bundle mode: %s, selected files: %s",
+                mode,
+                ", ".join(per_file_roles),
+            )
+            for name, reason in dropped:
+                logger.info("dropped file %s: %s", name, reason)
+
+            # Attach a role to each per-file provenance entry.
+            role_by_name: dict[str, str] = {}
+            for flag, path in zip(argv_flags[::2], argv_flags[1::2]):
+                role_by_name[path] = flag.lstrip("-")
+            for entry in file_provenance:
+                entry["role"] = role_by_name.get(entry["name"], "dropped")
+
+            # (c) Run gmxextract; argv is settings-owned + local temp paths only.
+            argv = [
+                settings.gmxextract_python,
+                settings.gmxextract_script,
+                *argv_flags,
+                "--format",
+                "json",
+                "--gmx_bin",
+                settings.gmxextract_gmx_bin,
+            ]
+            env = {**os.environ, "PYTHONPATH": settings.gmxextract_pythonpath}
+            logger.info("running command %s", argv)
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=tmpdir,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await process.communicate()
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+            # (d) Check the exit code, then parse stdout defensively.
+            if process.returncode != 0:
+                raise ApplicationError(
+                    "gmxextract exited with code "
+                    f"{process.returncode}; stderr tail: {stderr[-_STDERR_TAIL_CHARS:]}",
+                    type="GmxExtractFailed",
+                    non_retryable=True,
+                )
+            raw = _parse_gmxextract_output(stdout)
+
+            # (e) Map onto the experiment metadata schema and build provenance.
+            metadata, notes = map_gromacs_metadata_to_schema(raw)
+            for note in notes:
+                logger.info(
+                    "decision %s value=%s detail=%s",
+                    note["decision"],
+                    note["value"],
+                    note["detail"],
+                )
+
+            software = metadata["simulation_setup"]["software"]
+            version = metadata["simulation_setup"]["software_version"]
+            if software or version:
+                logger.info(
+                    "gromacs version %s %s",
+                    software,
+                    version,
+                )
+
+            provenance = {
+                "files": file_provenance,
+                "logging": loggerBuffer.getvalue().splitlines(),
+                "raw": raw,
             }
-        )
-        for name, reason in dropped:
-            logger.info(
-                "dropped file %s: %s", name, reason
-            )
-            decisions.append(
-                {
-                    "decision": "file_dropped",
-                    "value": name,
-                    "detail": reason,
-                }
-            )
+    finally:
+        # Detach the buffer handler so retries do not stack handlers on the
+        # shared logger (which would duplicate and leak lines).
+        logger.removeHandler(loggerHandler)
 
-        # Attach a role to each per-file provenance entry.
-        role_by_name: dict[str, str] = {}
-        for flag, path in zip(argv_flags[::2], argv_flags[1::2]):
-            role_by_name[path] = flag.lstrip("-")
-        for entry in file_provenance:
-            entry["role"] = role_by_name.get(entry["name"], "dropped")
-
-        # (c) Run gmxextract; argv is settings-owned + local temp paths only.
-        argv = [
-            settings.gmxextract_python,
-            settings.gmxextract_script,
-            *argv_flags,
-            "--format",
-            "json",
-            "--gmx_bin",
-            settings.gmxextract_gmx_bin,
-        ]
-        env = {**os.environ, "PYTHONPATH": settings.gmxextract_pythonpath}
-        logger.info("running command %s", argv)
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=tmpdir,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_bytes, stderr_bytes = await process.communicate()
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-
-        # (d) Check the exit code, then parse stdout defensively.
-        if process.returncode != 0:
-            raise ApplicationError(
-                "gmxextract exited with code "
-                f"{process.returncode}; stderr tail: {stderr[-_STDERR_TAIL_CHARS:]}",
-                type="GmxExtractFailed",
-                non_retryable=True,
-            )
-        raw = _parse_gmxextract_output(stdout)
-
-        # (e) Map onto the experiment metadata schema and build provenance.
-        metadata, notes = map_gromacs_metadata_to_schema(raw)
-        for note in notes:
-            logger.info(
-                "decision %s value=%s detail=%s",
-                note["decision"],
-                note["value"],
-                note["detail"],
-            )
-            decisions.append(note)
-
-        software = metadata["simulation_setup"]["software"]
-        version = metadata["simulation_setup"]["software_version"]
-        if software or version:
-            logger.info(
-                "gromacs version %s %s",
-                software,
-                version,
-            )
-            decisions.append(
-                {
-                    "decision": "gromacs_version",
-                    "value": version,
-                    "detail": f"software={software!r} parsed by gmxextract "
-                    "from gmx stderr",
-                }
-            )
-        decisions.append(
-            {
-                "decision": "command",
-                "value": argv,
-                "detail": "exact argv passed to gmxextract",
-            }
-        )
-
-        provenance = {
-            "files": file_provenance,
-            "logging": loggerBuffer.getvalue().splitlines(),
-            "raw": raw,
-        }
     return ExtractGromacsMetadataResponse(
         metadata=metadata, provenance=provenance
     )
