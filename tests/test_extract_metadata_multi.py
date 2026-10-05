@@ -74,7 +74,7 @@ def test_decide_files_three_file_bundle():
         ["em.gro", "em.tpr", "em.top"]
     )
     assert argv == ["--tpr", "em.tpr", "--gro", "em.gro", "--top", "em.top"]
-    assert roles == ["em.tpr (--tpr)", "em.gro (--gro)", "em.top (--top)"]
+    assert roles == ["(--tpr) em.tpr", "(--gro) em.gro", "(--top) em.top"]
     assert dropped == []
 
 
@@ -105,7 +105,7 @@ def test_decide_files_tie_breaks_alphabetically():
         ["beta.gro", "alpha.tpr", "beta.tpr", "alpha.gro"]
     )
     assert argv == ["--tpr", "alpha.tpr", "--gro", "alpha.gro"]
-    assert roles == ["alpha.tpr (--tpr)", "alpha.gro (--gro)"]
+    assert roles == ["(--tpr) alpha.tpr", "(--gro) alpha.gro"]
     assert dict(dropped) == {
         "beta.gro": "basename differs from chosen bundle 'alpha'",
         "beta.tpr": "basename differs from chosen bundle 'alpha'",
@@ -130,7 +130,7 @@ def test_decide_files_unsupported_extension_dropped():
     """Non-tpr/gro/top/loose files are dropped with a reason."""
     argv, roles, dropped = _decide_files(["em.tpr", "em.log", "em.xtc"])
     assert argv == ["--tpr", "em.tpr"]
-    assert roles == ["em.tpr (--tpr)"]
+    assert roles == ["(--tpr) em.tpr"]
     assert dict(dropped) == {
         "em.log": "unsupported extension (expected .tpr/.gro/.top)",
         "em.xtc": "unsupported extension (expected .tpr/.gro/.top)",

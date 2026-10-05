@@ -70,7 +70,7 @@ def _decide_files(names: list[str]) -> tuple[list[str], list[str], list[tuple[st
         ``(argv_flag_pairs, per_file_roles, dropped)`` where
         ``argv_flag_pairs`` is the flat flag/path list to append to the
         command line, ``per_file_roles`` maps each selected filename to its
-        flag as ``"name (--flag)"`` strings, and ``dropped`` lists
+        flag as ``"(--flag) name"`` strings, and ``dropped`` lists
         ``(name, reason)`` for every excluded file.
 
     Raises:
@@ -353,29 +353,27 @@ async def extract_gromacs_metadata(
             if process.returncode != 0:
                 raise ApplicationError(
                     "gmxextract exited with code "
-                    f"{process.returncode}; stderr tail: {stderr[-_STDERR_TAIL_CHARS:]}",
+                    f"{process.returncode}; stderr tail: "
+                    f"{stderr[-_STDERR_TAIL_CHARS:]}",
                     type="GmxExtractFailed",
                     non_retryable=True,
                 )
             raw = _parse_gmxextract_output(stdout)
 
             # (e) Map onto the experiment metadata schema and build provenance.
-            metadata, notes = map_gromacs_metadata_to_schema(raw)
-            for note in notes:
-                logger.info(
-                    "decision %s value=%s detail=%s",
-                    note["decision"],
-                    note["value"],
-                    note["detail"],
-                )
+            metadata = map_gromacs_metadata_to_schema(raw, logger)
 
             software = metadata["simulation_setup"]["software"]
             version = metadata["simulation_setup"]["software_version"]
             if software or version:
                 logger.info(
-                    "gromacs version %s %s",
+                    "sanity check: gromacs version used is %s %s",
                     software,
                     version,
+                )
+            else:
+                logger.error(
+                    "unable to extract software nor version!"
                 )
 
             provenance = {

@@ -16,19 +16,62 @@ experiment record ``metadata`` schema (see
 - ``metadata.system``
 
 The mapping is deterministic and never fabricates values: an absent source
-key maps to ``None``. Every mappable-but-absent source key, and every derived
-value (e.g. the box type), is reported back as a decision note
-(``{"decision", "value", "detail"}``) so the activity can attach it to the
-workflow's provenance.
+key maps to ``None``. No notes are collected along the way; at the end the
+result is checked key by key against the expected fields, and every null
+key is logged (with the source it was looked up under) on the ``log``
+logger passed in by the caller.
 """
 
+import logging
 from typing import Any
 
 # Relative tolerance for the a == b == c box-type comparison.
 CUBIC_TOLERANCE = 1e-6
 
-# Off-diagonal box entries (row 2, cols 0-1) considered "zero".
-_OFFDIAGONAL_ZERO_TOLERANCE = 0.0
+
+# The exact keys the experiment metadata schema expects, per sub-object.
+_EXPECTED_FIELDS: dict[str, tuple[str, ...]] = {
+    "simulation_setup": (
+        "software",
+        "software_version",
+        "force_field",
+        "water_model",
+        "integrator",
+    ),
+    "thermodynamic_state": (
+        "ensemble",
+        "reference_temperature",
+        "reference_pressure",
+        "thermostat",
+        "barostat",
+    ),
+    "temporal_extent": (
+        "simulation_length",
+        "timestep",
+        "number_of_steps",
+    ),
+    "system": (
+        "total_atoms",
+        "box_type",
+        "box_dimensions",
+    ),
+}
+
+# Where each expected field is looked up under, in the gmxextract JSON.
+_SOURCES = {
+    "simulation_setup.software": "administrative.software_information.software",
+    "simulation_setup.software_version": "administrative.software_information.version",
+    "simulation_setup.integrator": "simulation.inputrec.integrator",
+    "simulation_setup.force_field": "simulation.forcefield",
+    "simulation_setup.water_model": "system.water_model",
+    "thermodynamic_state.thermostat": "simulation.inputrec.tcoupl",
+    "thermodynamic_state.barostat": "simulation.inputrec.pcoupl",
+    "thermodynamic_state.reference_temperature": "simulation.inputrec.ref_t",
+    "thermodynamic_state.reference_pressure": "simulation.inputrec.ref_p",
+    "temporal_extent.timestep": "simulation.inputrec.dt",
+    "temporal_extent.number_of_steps": "simulation.inputrec.nsteps",
+    "system.total_atoms": "simulation.header.natoms",
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -81,22 +124,61 @@ def _box_matrix(simulation: dict[str, Any]) -> list[float] | None:
     return flattened
 
 
+def _log_unmapped(
+    metadata: dict[str, dict[str, Any]],
+    log: logging.Logger,
+) -> None:
+    """Check every expected field; log each one that is null and why."""
+
+    def reason(path: str) -> str:
+        if path == "thermodynamic_state.ensemble":
+            return "ensemble is not derivable from gmxextract output"
+        if path == "temporal_extent.simulation_length":
+            return (
+                "simulation_length = dt * nsteps / 1000 (ns) not computed: "
+                "dt and/or nsteps absent"
+            )
+        if path == "system.box_type":
+            return "box diagonals are not equal; no box type inferred"
+        if path == "system.box_dimensions":
+            return "simulation.box (3x3) absent or malformed"
+        return f"{_SOURCES[path]} absent"
+
+    missing = [
+        f"{sub}.{field}"
+        for sub, fields in _EXPECTED_FIELDS.items()
+        for field in fields
+        if metadata[sub][field] is None
+    ]
+    if not missing:
+        return
+    for path in missing:
+        log.info("metadata field %s is null: %s", path, reason(path))
+    log.info(
+        "metadata diff: %d of %d expected fields are null: %s",
+        len(missing),
+        sum(len(fields) for fields in _EXPECTED_FIELDS.values()),
+        ", ".join(missing),
+    )
+
+
 def map_gromacs_metadata_to_schema(
     raw: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    log: logging.Logger,
+) -> dict[str, dict[str, Any]]:
     """Map a gmxextract JSON object onto the experiment metadata schema.
 
     Args:
         raw: The parsed gmxextract output. Any shape is tolerated; malformed
             or missing nested keys map to ``None`` rather than raising.
+        log: Logger for the end-of-run diff (one line per null field plus a
+            summary); typically the activity's per-run logger.
 
     Returns:
-        A ``(metadata, notes)`` tuple where ``metadata`` always contains all
-        four sub-objects (``simulation_setup``, ``thermodynamic_state``,
-        ``temporal_extent``, ``system``; keys present, values may be null) and
-        ``notes`` is a list of ``{"decision", "value", "detail"}`` dicts.
+        The ``metadata`` dict, always containing all four sub-objects
+        (``simulation_setup``, ``thermodynamic_state``, ``temporal_extent``,
+        ``system``; keys present, values may be null).
     """
-    notes: list[dict[str, Any]] = []
     simulation = _as_dict(_as_dict(raw).get("simulation"))
     inputrec = _as_dict(simulation.get("inputrec"))
     header = _as_dict(simulation.get("header"))
@@ -105,202 +187,46 @@ def map_gromacs_metadata_to_schema(
 
     # --- metadata.simulation_setup -------------------------------------
     software = _get_path(administrative, "software_information", "software")
-    if software is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "simulation_setup.software",
-                "detail": "administrative.software_information.software absent",
-            }
-        )
     software_version = _get_path(
         administrative, "software_information", "version"
     )
-    if software_version is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "simulation_setup.software_version",
-                "detail": "administrative.software_information.version absent",
-            }
-        )
     integrator = inputrec.get("integrator")
-    if integrator is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "simulation_setup.integrator",
-                "detail": "simulation.inputrec.integrator absent",
-            }
-        )
     force_field = simulation.get("forcefield")
-    if force_field is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "simulation_setup.force_field",
-                "detail": "simulation.forcefield absent (.top input with an "
-                "amber force field not provided)",
-            }
-        )
     water_model = system.get("water_model")
-    if water_model is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "simulation_setup.water_model",
-                "detail": "system.water_model absent (.top input not provided)",
-            }
-        )
 
     # --- metadata.thermodynamic_state ----------------------------------
     thermostat = inputrec.get("tcoupl")
     if _is_nullish(thermostat):
         thermostat = None
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "thermodynamic_state.thermostat",
-                "detail": "simulation.inputrec.tcoupl is \"No\", empty or absent",
-            }
-        )
     barostat = inputrec.get("pcoupl")
     if _is_nullish(barostat):
         barostat = None
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "thermodynamic_state.barostat",
-                "detail": "simulation.inputrec.pcoupl is \"No\", empty or absent",
-            }
-        )
     reference_temperature = _as_number(inputrec.get("ref_t"))
-    if reference_temperature is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "thermodynamic_state.reference_temperature",
-                "detail": "simulation.inputrec.ref_t absent",
-            }
-        )
     reference_pressure = _as_number(inputrec.get("ref_p"))
-    if reference_pressure is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "thermodynamic_state.reference_pressure",
-                "detail": "simulation.inputrec.ref_p absent",
-            }
-        )
-    # The ensemble is not derivable from gmxextract output. Never inferred.
-    notes.append(
-        {
-            "decision": "field_unmapped",
-            "value": "thermodynamic_state.ensemble",
-            "detail": "ensemble is not derivable from gmxextract output",
-        }
-    )
 
     # --- metadata.temporal_extent ---------------------------------------
     timestep = _as_number(inputrec.get("dt"))
-    if timestep is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "temporal_extent.timestep",
-                "detail": "simulation.inputrec.dt absent",
-            }
-        )
     number_of_steps = _as_number(inputrec.get("nsteps"))
-    if number_of_steps is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "temporal_extent.number_of_steps",
-                "detail": "simulation.inputrec.nsteps absent",
-            }
-        )
-    simulation_length: float | None
     if timestep is None or number_of_steps is None:
-        simulation_length = None
-        notes.append(
-            {
-                "decision": "computation",
-                "value": "temporal_extent.simulation_length",
-                "detail": "simulation_length = dt * nsteps / 1000 (ns) skipped: "
-                "dt and/or nsteps absent",
-            }
-        )
+        simulation_length: float | None = None
     else:
         simulation_length = timestep * number_of_steps / 1000
-        notes.append(
-            {
-                "decision": "computation",
-                "value": simulation_length,
-                "detail": "simulation_length = dt * nsteps / 1000 "
-                f"({timestep} fs * {number_of_steps} steps / 1000)",
-            }
-        )
 
     # --- metadata.system -------------------------------------------------
     total_atoms = _as_number(header.get("natoms"))
-    if total_atoms is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "system.total_atoms",
-                "detail": "simulation.header.natoms absent",
-            }
-        )
 
     # Box: diagonal of simulation["box (3x3)"].
     box_dimensions: list[float] | None = None
     box_type: str | None = None
     matrix = _box_matrix(simulation)
-    if matrix is None:
-        notes.append(
-            {
-                "decision": "field_unmapped",
-                "value": "system.box_dimensions",
-                "detail": "simulation.box (3x3) absent or malformed",
-            }
-        )
-    else:
+    if matrix is not None:
         box_dimensions = [matrix[0], matrix[4], matrix[8]]
         a, b, c = box_dimensions
-        off_diagonals = [
-            (name, value)
-            for name, value in (
-                ("box[2][0]", matrix[6]),
-                ("box[2][1]", matrix[7]),
-            )
-            if abs(value) > _OFFDIAGONAL_ZERO_TOLERANCE
-        ]
-        if off_diagonals:
-            notes.append(
-                {
-                    "decision": "box_offdiagonal",
-                    "value": [name for name, _ in off_diagonals],
-                    "detail": "non-zero off-diagonal box entries reported as "
-                    f"{dict(off_diagonals)}; box_dimensions holds the 3 "
-                    "diagonals only, angles are not inferred",
-                }
-            )
         if a == b == c or (
             abs(a - b) <= CUBIC_TOLERANCE * abs(a)
             and abs(a - c) <= CUBIC_TOLERANCE * abs(a)
         ):
             box_type = "cubic"
-        else:
-            notes.append(
-                {
-                    "decision": "field_unmapped",
-                    "value": "system.box_type",
-                    "detail": f"box diagonals {a}, {b}, {c} are not equal "
-                    "(relative tolerance "
-                    f"{CUBIC_TOLERANCE}); no box type inferred",
-                }
-            )
 
     metadata = {
         "simulation_setup": {
@@ -328,4 +254,7 @@ def map_gromacs_metadata_to_schema(
             "box_dimensions": box_dimensions,
         },
     }
-    return metadata, notes
+
+    # --- end of run: diff the result against the expected fields ---------
+    _log_unmapped(metadata, log)
+    return metadata
