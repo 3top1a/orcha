@@ -20,15 +20,14 @@ from datetime import timedelta
 
 import httpx
 from pydantic import BaseModel
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
+from io import StringIO
 
 from app.activities.utils import http_verify
 from app.config import get_settings
 from app.schemas.gromacs_metadata import map_gromacs_metadata_to_schema
-
-logger = logging.getLogger(__name__)
 
 EXTRACT_GROMACS_RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -119,7 +118,7 @@ def _decide_files(names: list[str]) -> tuple[list[str], list[str], list[tuple[st
     if len(counts) > 1:
         other_counts = {b: c for b, c in counts.items() if b != chosen}
         logger.info(
-            "extract_gromacs_metadata: bundle basename %r wins over %s "
+            "bundle basename %r wins over %s "
             "(counts: %r)",
             chosen,
             other_counts,
@@ -197,7 +196,7 @@ async def _probe_file_size(
     try:
         response = await client.get(url, headers={"Range": "bytes=0-0"})
     except httpx.HTTPError as e:
-        logger.debug("extract_gromacs_metadata: size probe failed: %s", e)
+        logger.debug("size probe failed: %s", e)
         return None
     total: int | None = None
     if response.status_code == 206:
@@ -211,7 +210,7 @@ async def _probe_file_size(
         except (KeyError, ValueError):
             pass
     if total is not None:
-        logger.info("extract_gromacs_metadata: %s is %d bytes", url, total)
+        logger.info("%s is %d bytes", url, total)
     return total
 
 
@@ -263,51 +262,55 @@ async def extract_gromacs_metadata(
     decisions: list[dict] = []
     file_provenance: list[dict] = []
 
-    # (a) Verify every URL, then download all files with one client.
-    names = sorted(request.files)
-    verify = False
-    for name in names:
-        try:
-            file_verify = http_verify(request.files[name])
-        except ValueError as e:
-            raise ApplicationError(
-                str(e),
-                type="HostNotAllowed",
-                non_retryable=True,
-            ) from e
-        verify = verify or file_verify
-    if verify:
-        logger.info(
-            "extract_gromacs_metadata: at least one URL requires TLS "
-            "verification; verifying all downloads"
-        )
-
+    # Create a new logger
+    logger = logging.getLogger(__name__ + '.extract_gromacs_metadata')
+    loggerBuffer = StringIO()
+    loggerHandler = logging.StreamHandler(loggerBuffer)
+    logger.addHandler(loggerHandler)
+    
+    # Download all files with one client.
     with tempfile.TemporaryDirectory(prefix="gmxextract-") as tmpdir:
         max_bytes = settings.gmxextract_max_download_bytes
-        async with httpx.AsyncClient(verify=verify) as client:
-            for name in names:
-                url = request.files[name]
-                path = os.path.join(tmpdir, name)
-                size = await _download_file(client, url, path, max_bytes)
-                logger.info(
-                    "extract_gromacs_metadata: downloaded %s (%d bytes)",
-                    name,
-                    size,
-                )
-                file_provenance.append(
-                    {
-                        "name": name,
-                        "url": url,
-                        "bytes": size,
-                        "status": "ok",
-                    }
-                )
+        async with httpx.AsyncClient(verify=True) as client:
+            for filename, url in request.files.items():
+                path = os.path.join(tmpdir, filename)
+
+                if not http_verify(url):
+                    logger.info(
+                        "%s is not an allowed host, will not process",
+                        filename,
+                    )
+
+                try:
+                    size = await _download_file(client, url, path, max_bytes)
+                except ApplicationError as e:
+                    file_provenance.append(
+                        {
+                            "name": filename,
+                            "bytes": size,
+                            "status": "error",
+                        }
+                    )
+                else:
+                    logger.info(
+                        "downloaded %s (%d bytes)",
+                        filename,
+                        size,
+                    )
+                    file_provenance.append(
+                        {
+                            "name": filename,
+                            "bytes": size,
+                            "status": "ok",
+                        }
+                    )
 
         # (b) Decide which files to pass to gmxextract.
-        argv_flags, per_file_roles, dropped = _decide_files(names)
+        # TODO The agent fucked up here, and first downloads all instead of first filtering and then downloading.
+        argv_flags, per_file_roles, dropped = _decide_files(request.files.keys())
         mode = "archive" if argv_flags and argv_flags[0] == "--archive" else "loose"
         for role in per_file_roles:
-            logger.info("extract_gromacs_metadata: selected file %s", role)
+            logger.info("selected file %s", role)
         decisions.append(
             {
                 "decision": "bundle_selected",
@@ -317,7 +320,7 @@ async def extract_gromacs_metadata(
         )
         for name, reason in dropped:
             logger.info(
-                "extract_gromacs_metadata: dropped file %s: %s", name, reason
+                "dropped file %s: %s", name, reason
             )
             decisions.append(
                 {
@@ -345,7 +348,7 @@ async def extract_gromacs_metadata(
             settings.gmxextract_gmx_bin,
         ]
         env = {**os.environ, "PYTHONPATH": settings.gmxextract_pythonpath}
-        logger.info("extract_gromacs_metadata: running command %s", argv)
+        logger.info("running command %s", argv)
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=tmpdir,
@@ -371,7 +374,7 @@ async def extract_gromacs_metadata(
         metadata, notes = map_gromacs_metadata_to_schema(raw)
         for note in notes:
             logger.info(
-                "extract_gromacs_metadata: decision %s value=%s detail=%s",
+                "decision %s value=%s detail=%s",
                 note["decision"],
                 note["value"],
                 note["detail"],
@@ -382,7 +385,7 @@ async def extract_gromacs_metadata(
         version = metadata["simulation_setup"]["software_version"]
         if software or version:
             logger.info(
-                "extract_gromacs_metadata: gromacs version %s %s",
+                "gromacs version %s %s",
                 software,
                 version,
             )
@@ -404,8 +407,7 @@ async def extract_gromacs_metadata(
 
         provenance = {
             "files": file_provenance,
-            "decisions": decisions,
-            "command": argv,
+            "logging": loggerBuffer.getvalue().splitlines(),
             "raw": raw,
         }
     return ExtractGromacsMetadataResponse(
